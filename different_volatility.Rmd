@@ -1,0 +1,357 @@
+---
+title: "trading with different volatilities"
+author: 
+  - "Gurkamal Pannu"
+  - "Maria Nikitanova"
+  - "Max Yamamoto"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+
+```{r functions}
+library(tidyverse)
+library(moments)
+
+get_d1 <- function(s, k, r, sigma, t) {
+  d1 <-
+    log(s * exp(r*t) / k) / (sigma * sqrt(t)) + 
+       (sigma * sqrt(t)) / 2
+  return(d1)
+}
+
+bs_call <-  function(s, k, r, sigma, t) {
+  d1 <- get_d1(s, k, r,  sigma, t)
+  d2 <- d1 - sigma * sqrt(t)
+  c0 <-  s * pnorm(d1) - exp(-r * t) * k * pnorm(d2)
+  return(c0)
+}
+
+get_gamma <- function(s, k_var, r_var, sigma_var, extime){
+  d_1 <- get_d1(s, k_var, r_var, sigma_var, extime)
+  return(exp(-(d_1^2)/2)/(s * sigma_var * sqrt(extime) * sqrt(2*pi)))
+}
+
+get_random_and_stock <-
+  function(seed,
+           steps,
+           period,
+           mu_annual,
+           sigma_annual,
+           r_annual,
+           attempt,
+           s,
+           vol_hedge_annual,
+           vol_implied_annual) {
+  
+  time <- steps / period
+  mu <- exp(log(1 + mu_annual)/period) - 1
+  sigma <- sigma_annual / sqrt(period)
+  r <- exp(log(1 + r_annual) / period) - 1
+  vol_hedge <- vol_hedge_annual / sqrt(period)
+  vol_implied <- vol_implied_annual / sqrt(period)
+  
+  set.seed(seed)
+  
+  rand_variables_raw <- 
+    rnorm(attempt * steps, mean = 0, sd = 1) |> 
+    matrix(ncol = attempt) |> 
+    data.frame() |> 
+    tibble() 
+  
+  rand_variables <-
+    rep(s, attempt) |>
+    rbind(rand_variables_raw |>
+            mutate_all( ~ cumprod(exp((mu-(sigma^2)/2) + sigma * .))) |>
+            mutate_all( ~ . * s)) |>
+    mutate(extime = time - (row_number() - 1) / period,
+           periods = row_number() - 1) |>
+    relocate(periods, extime)
+  
+  stock_path_long <- 
+    rand_variables |> 
+    select(periods, starts_with("X")) |> 
+    pivot_longer(cols = -periods) |> 
+    mutate(type = "stock")
+  
+  trading_simu <- 
+    rand_variables |> 
+    mutate(
+      k_var = k,
+      r_var = r_annual,
+      sigma_var = sigma_annual,
+      t_var = time,
+      steps_var = steps,
+      vol_hedge_var = vol_hedge_annual,
+      vol_implied_var = vol_implied_annual
+    ) 
+  
+  option_path_long <- 
+    trading_simu |> 
+    mutate_at(vars(starts_with("X")),
+              ~ bs_call(., k_var, r_var, vol_implied_var, extime)) |> 
+    select(periods, starts_with("X")) |> 
+    pivot_longer(cols = -periods) |> 
+    mutate(type = "option")
+    
+  hedge_path_long <- 
+    trading_simu |> 
+    mutate_at(vars(starts_with("X")),
+              ~ pnorm(get_d1(., k_var, r_var, vol_hedge_var, extime))) |>
+    
+    select(periods, starts_with("X")) |> 
+    pivot_longer(cols = -periods) |> 
+    mutate(type = "hedge")
+    
+  gamma_path_long <- 
+    trading_simu |> 
+    mutate_at(vars(starts_with("X")),
+              ~ get_gamma(., k_var, r_var, vol_hedge_var, extime)) |> 
+    select(periods, starts_with("X")) |> 
+    pivot_longer(cols = -periods) |> 
+    mutate(type = "gamma")
+  
+    dat_all_long <- 
+      rbind(stock_path_long,
+            option_path_long, 
+            hedge_path_long,
+            gamma_path_long)
+    
+    return(dat_all_long)
+}
+
+trading_simulation <- function(dat_all_long, lag_no = 1){
+  short_option_pl <- 
+    dat_all_long |> 
+    pivot_wider(values_from = value, names_from = type) |> 
+    group_by(name) |> 
+    mutate(option_pl = option - lag(option, lag_no),
+           hedge_pl = (stock - lag(stock, lag_no)) * lag(hedge, lag_no),
+           total_pl = hedge_pl - option_pl) |> 
+    drop_na()
+  
+  trading_results <- 
+    short_option_pl |>
+    mutate(option_pl = cumsum(option_pl),
+           hedge_pl = cumsum(hedge_pl),
+           total_pl = cumsum(total_pl)) |> 
+    filter(periods == max(periods)) |> 
+    select(number = name, total_pl, option_pl, total_pl)
+  
+  return(trading_results)
+}
+
+results_hist <- function(trading_results, x_axis, title){
+  trading_results |> 
+    select(number, all_of(x_axis)) |> 
+    pivot_longer(cols = -number) |> 
+    ggplot() +
+    aes(x = value) +
+    geom_histogram() +
+    labs(y = "", x = x_axis, title = title)
+}
+
+visualize <- function(dat_long, title){
+  dat_long |> 
+    ggplot() +
+    aes(x = periods, y = value, color = name) + 
+    geom_line() +
+    theme(legend.position = "none") + 
+    labs(y = "", x = "steps", title = title )
+}
+```
+
+# Next steps (daily simulation)
+
+- Base case actual = implied = hedging = .25 sigma
+- Case 1: actual = hedging = .25 but implied = .35.
+- Case 2: actual = hedging  = .25 but implied = .15 
+- Case 3: hedging = implied = .25 but actual = .35 
+- Case 4: hedging = implied = .25 but actual = .15 
+
+the stochastic process of the simulation
+$$
+S_{t+\Delta t} = S_t \times exp((\mu - \frac{\sigma^2}{2})\Delta t + \sigma \sqrt{\Delta t} N(0,1))
+$$
+
+# Case 1
+```{r}
+attempt <- 1000
+period <- 360
+steps <- 90
+mu_annual <- 0.01 
+sigma_annual <- 0.25
+r_annual <- 0.01 
+s <- 50
+k <- 50
+seed <- 10
+
+vol_hedge_annual = 0.25
+vol_implied_annual = 0.35
+
+dat_all_long <-
+  get_random_and_stock(seed,
+                       steps,
+                       period,
+                       mu_annual,
+                       sigma_annual,
+                       r_annual,
+                       attempt,
+                       s,
+                       vol_hedge_annual,
+                       vol_implied_annual)
+
+trading_results <- trading_simulation(dat_all_long, lag_no = 1)
+
+results_hist(trading_results, "total_pl", "Case 1: higher implied volatility")
+
+```
+
+# Case 2
+
+```{r}
+vol_implied_annual <- 0.15
+
+dat_all_long_2 <-
+  get_random_and_stock(seed,
+                       steps,
+                       period,
+                       mu_annual,
+                       sigma_annual,
+                       r_annual,
+                       attempt,
+                       s,
+                       vol_hedge_annual,
+                       vol_implied_annual)
+
+trading_results_2 <- trading_simulation(dat_all_long_2, lag_no = 1)
+
+results_hist(trading_results_2, "total_pl", "Case 2: lower implied volatility")
+```
+
+# summary
+```{r}
+results <- 
+  rbind(trading_results |> mutate(implied = "higher implied vol"),
+        trading_results_2 |> mutate(implied = "lower implied vol"))
+
+results |> 
+  group_by(implied) |> 
+  summarise(sample_average = mean(total_pl),
+            sample_sd = sd(total_pl),
+            sample_skew = skewness(total_pl),
+            sample_kurt = kurtosis(total_pl),
+            sample_sharpe = mean(total_pl) / sd(total_pl)) |> 
+  #t() |> 
+  knitr::kable(digits = 2)
+```
+
+## check the stats of simulations
+```{r}
+dat_all_long_2 |> 
+  filter(periods == max(periods), type != "gamma") |> 
+  group_by(type) |> 
+  summarise(sample_average = mean(value, na.rm = TRUE),
+            sample_std = sd(value, na.rm = TRUE)) |> 
+  mutate(sample_average = if_else(type == "stock", sample_average/s, sample_average),
+         sample_std = if_else(type == "stock", sample_std/s, sample_std)) |> 
+  knitr::kable(digits = 2)
+```
+
+# Case 3: hedging = implied but looking at actual vol being both lower
+```{r}
+sigma_annual <- 0.35
+vol_hedge_annual = 0.25
+vol_implied_annual = 0.25
+
+dat_all_long_3 <-
+  get_random_and_stock(seed,
+                       steps,
+                       period,
+                       mu_annual,
+                       sigma_annual,
+                       r_annual,
+                       attempt,
+                       s,
+                       vol_hedge_annual,
+                       vol_implied_annual)
+
+trading_results_3 <- trading_simulation(dat_all_long_3, lag_no = 1)
+
+results_hist(trading_results_3, "total_pl", "Case 3: higher actual volatility")
+
+```
+
+# Case 4: hedging = implied but looking at actual vol being lower
+```{r}
+sigma_annual <- 0.15
+vol_hedge_annual = 0.25
+vol_implied_annual = 0.25
+
+dat_all_long_4 <-
+  get_random_and_stock(seed,
+                       steps,
+                       period,
+                       mu_annual,
+                       sigma_annual,
+                       r_annual,
+                       attempt,
+                       s,
+                       vol_hedge_annual,
+                       vol_implied_annual)
+
+trading_results_4 <- trading_simulation(dat_all_long_4, lag_no = 1)
+
+results_hist(trading_results_4, "total_pl", "Case 4: lower actual volatility")
+
+```
+
+# summary: Case 3 and Case 4
+```{r}
+results <- 
+  rbind(trading_results_3 |> mutate(actual = "higher actual vol"),
+        trading_results_4 |> mutate(actual = "lower actual vol"))
+
+results |> 
+  group_by(actual) |> 
+  summarise(sample_average = mean(total_pl),
+            sample_sd = sd(total_pl),
+            sample_skew = skewness(total_pl),
+            sample_kurt = kurtosis(total_pl),
+            sample_sharpe = mean(total_pl) / sd(total_pl)) |> 
+  #t() |> 
+  knitr::kable(digits = 2)
+```
+
+
+# Base case: all equal
+```{r}
+sigma_annual <- 0.25
+vol_hedge_annual = 0.25
+vol_implied_annual = 0.25
+
+dat_all_long_5 <-
+  get_random_and_stock(seed,
+                       steps,
+                       period,
+                       mu_annual,
+                       sigma_annual,
+                       r_annual,
+                       attempt,
+                       s,
+                       vol_hedge_annual,
+                       vol_implied_annual)
+
+trading_results_5 <- trading_simulation(dat_all_long_5, lag_no = 1)
+
+results_hist(trading_results_5, "total_pl", "Base Case: all equal")
+
+```
